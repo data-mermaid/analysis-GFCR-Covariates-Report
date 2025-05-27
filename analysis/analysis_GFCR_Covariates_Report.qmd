@@ -1,0 +1,247 @@
+---
+title: "GFCR Covariates Report"
+author: "Iain R. Caldwell"
+date: 05/27/2025
+format: 
+  html: #for website
+    embed-resources: true
+editor: visual
+toc: true
+title-block-banner: "#f0f3f5"
+title-block-banner-color: "black"
+include-after-body: "footer.html"
+---
+
+------------------------------------------------------------------------
+
+## Context - Getting environmental covariates for GFCR locations
+
+This report extracts environmental covariates for GFCR project sites from MERMAID, then combines that with coral cover data to plot the relationship between the two. In this example, the environmental data is maximum mean degree heating weeks (DHW) over the 24 months prior to the survey. However, there is a parameter to change from 24 to another number of months.
+
+------------------------------------------------------------------------
+
+## Load packages, define functions, set parameters
+
+Several packages are used in this code and their libraries need to be loaded. This section also defines a function to get all STAC items with pagination. Lastly, the parameter for buffer size (the buffer around a site) is set here. That buffer determines the distance around the point for which covariate data should be gathered.
+
+```{r}
+#| label: Load packages, define STAC function, set parameters
+#| warning: false
+
+rm(list = ls()) #remove past stored objects
+options(scipen = 999) #turn off scientific notation
+
+####  Load packages and libraries ####
+## If this is the first time using mermaidr, install the package through "remotes"
+# install.packages("remotes")
+# remotes::install_github("data-mermaid/mermaidr")
+library(mermaidr) #package to download data from datamermaid.org
+library(tidyverse) #package that makes it easier to work with data
+library(sf)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(DT) #package for interactive tables
+library(ggplot2)
+library(knitr)
+
+# Function to fetch all STAC items with pagination
+get_all_stac_items <- function(base_url) {
+  all_features <- list()
+  next_url <- base_url
+  
+  while (!is.null(next_url)) {
+    res <- GET(next_url)
+    stop_for_status(res)
+    parsed <- fromJSON(content(res, "text", encoding = "UTF-8"),
+                       simplifyVector = FALSE)
+    
+    # Collect features
+    all_features <- c(all_features, parsed$features)
+    
+    # Check for next link
+    links <- parsed$links
+    next_link <- links[which(map_chr(links, "rel") == "next")]
+    next_url <- if (length(next_link) > 0) next_link[[1]]$href else NULL
+  }
+  
+  # Combine features into a table
+  map_dfr(all_features, function(f) {
+    tibble(
+      datetime = as.Date(f$properties$datetime),
+      year_month = format(as.Date(f$properties$datetime), "%Y-%m"),
+      url = f$assets[[1]]$href
+    )
+  })
+}
+
+#### Set parameters ####
+base_stac_url <- "https://xv9pvd1by2.execute-api.us-east-1.amazonaws.com/dev/" #Above is the base URL for the STAC
+buffer_size <- 1000 #buffer size in meters
+x_months <- 24 #Number of months previous to the sample date to examine
+```
+
+------------------------------------------------------------------------
+
+## Getting GFCR project data from MERMAID
+
+To extract covariates data we will need a GFCR project that has site level data. We can then use the latitudes and longitudes from those sites with zonal statistics to get relevant data. The first step, then, is to extract such site data from a relevant GFCR project. Here this is accomplished by downloading the summary sample events and filtering to only include GFCR project with site level data. Since we ultimately want to compare the covariate with coral cover, we will also filter to only include benthic PIT surveys associated with GFCR projects.
+
+```{r}
+#| label: Get GFCR project data
+
+#### Filter summary sample event data to those tagged with "GFCR" ####
+gfcrSummSeTBL <- mermaid_get_summary_sampleevents() %>% 
+  filter(grepl(pattern = "GFCR", x = tags)) 
+
+#### Visualize a table of the GFCR projects with sites ####
+datatable(gfcrSummSeTBL %>%
+            group_by(project, tags, country) %>%
+            summarise(num_sites = length(site),
+                      benthicpit_avg_hardcoralcover = mean(`benthicpit_percent_cover_benthic_category_avg_Hard coral`, na.rm = T)) %>%
+            ungroup())
+
+#### Filter to only include summary sample events with benthic PIT data ####
+gfcrBenthicPitTBL <- gfcrSummSeTBL %>% 
+  filter(!is.na(`benthicpit_percent_cover_benthic_category_avg_Hard coral`)) %>% 
+  select(project, country,
+         site, latitude, longitude, sample_date,
+         `benthicpit_percent_cover_benthic_category_avg_Hard coral`) %>% 
+  rename(HardCoralCover = `benthicpit_percent_cover_benthic_category_avg_Hard coral`) %>% 
+  mutate(year_month = format(as.Date(sample_date), "%Y-%m"))
+```
+
+------------------------------------------------------------------------
+
+## Discover Available STAC Collections
+
+The following code snippet generates a list of all the collections currently available in the STAC.
+
+```{r}
+#| label: Discover STAC collections
+#| warning: false
+
+collections_url <- paste0(base_stac_url, "collections")
+
+collections_data <- jsonlite::fromJSON(content(httr::GET(collections_url), as = "text"), simplifyVector = FALSE)
+
+collection_ids <- purrr::map_chr(collections_data$collections, "id")
+
+kable(tibble(Collection = collection_ids), caption = "Available Collections")
+```
+
+------------------------------------------------------------------------
+
+## Get STAC Items for the selected collection, filtered by dates
+
+The next step is to extract covariates data for the latitudes and longitudes for the GFCR-associated benthic PIT surveys. In this example, we will focus on extracting degree heating weeks (DHW) data for the month and year of each survey.
+
+```{r}
+#| label: Get STAC items for selected collection
+
+# Select target collection (currently only one)
+target_collection <- collection_ids[1] #Get the first one
+
+items_url <- paste0(base_stac_url, "collections/", target_collection,
+                    "/items?limit=100")
+
+stac_assets_tbl <- get_all_stac_items(items_url)
+```
+
+------------------------------------------------------------------------
+
+## Extract maximum mean DHW for previous *x* months
+
+The following code extracts maximum mean degree heating weeks for the 12 months prior to each survey (or whatever number of months is defined above as "x_months"). This part of the code will take longer to run with more months (higher value of "x_months") and a larger buffer size.
+
+```{r}
+#| label: Extract maximum mean DHW for previous x months
+
+zonal_stats_list <- list()
+
+for (i in 1:nrow(gfcrBenthicPitTBL)) {
+  pt <- gfcrBenthicPitTBL[i, ]
+  sample_date <- as.Date(pt$sample_date)
+  coords <- c(pt$longitude, pt$latitude)
+  
+  prev_months <- seq(from = sample_date %m-% months(x_months - 1), to = sample_date, by = "1 month") %>%
+    format("%Y-%m")
+  
+  matching_rasters <- stac_assets_tbl %>%
+    filter(year_month %in% prev_months)
+  
+  if (nrow(matching_rasters) == 0) {
+    warning("No rasters found for feature ", i, " in previous ", x_months, " months.")
+    zonal_stats_list[[i]] <- tibble(max_mean = NA)
+    next
+  }
+  
+  mean_values <- numeric()
+  for (j in 1:nrow(matching_rasters)) {
+    raster_url <- matching_rasters$url[j]
+    request_body <- list(
+      aoi = list(type = "Point", coordinates = coords,
+                 buffer_size = buffer_size),
+      image = list(url = raster_url),
+      stats = list("mean")
+    )
+    
+    res <- POST(
+      url = "https://ltaxrc8a90.execute-api.us-east-1.amazonaws.com/v1/api/v1/zonal-stats",
+      body = request_body,
+      encode = "json",
+      add_headers(`Content-Type` = "application/json")
+    )
+    
+    if (status_code(res) == 200) {
+      band1 <- content(res, as = "parsed", simplifyVector = TRUE)$band_1
+      mean_values <- c(mean_values, band1$mean)
+    } else {
+      warning("Failed for raster ", raster_url, " in feature ", i, ": ", content(res, "text"))
+    }
+  }
+  
+  zonal_stats_list[[i]] <-
+    tibble(max_mean_DHW = ifelse(length(mean_values) == 0,
+                                 NA,
+                                 round(max(mean_values, na.rm = TRUE),
+                                       digits = 2)))
+}
+
+zonal_stats_tbl <- bind_rows(zonal_stats_list)
+final_data <- bind_cols(gfcrBenthicPitTBL, zonal_stats_tbl)
+
+#### Visualize a table of the GFCR data with the maximum mean DHW ####
+datatable(final_data %>%
+            select(project, country, site, sample_date,
+                   HardCoralCover, max_mean_DHW))
+
+```
+
+------------------------------------------------------------------------
+
+## Visualize coral cover vs. maximum mean DHW
+
+To show that the code worked, here is a visualization that shows the coral cover against the maximum mean DHW from the past x months.
+
+```{r}
+#| label: Visualize coral cover vs. covariate (max mean DHW)
+
+library(ggplot2)
+
+ggplot(final_data,
+       aes(x = max_mean_DHW,
+           y = HardCoralCover)) +
+  geom_point(color = "darkblue", alpha = 0.6) +
+  geom_smooth(method = "lm", color = "red", linetype = "dashed") +
+  labs(
+    title = paste("Coral Cover vs. Max DHW Mean (Previous", x_months, "Months)"),
+    x = "Max Mean DHW",
+    y = "Hard Coral Cover (%)"
+  ) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+## 
